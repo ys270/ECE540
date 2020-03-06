@@ -1,15 +1,6 @@
 #include<unistd.h>
 #include<stdio.h>
 #include<sys/types.h>
-#include<limits.h>
-#include <pthread.h>
-//version 1
-void* ts_malloc_lock(size_t size);
-void ts_free_lock(void *ptr);
-//version 2
-void* ts_malloc_nolock(size_t size);
-void ts_free_nolock(void *ptr);
-//project1
 void* ff_malloc(size_t size);
 void ff_free(void *ptr);
 void* bf_malloc(size_t size);
@@ -20,17 +11,24 @@ unsigned long get_data_segment_size();
 unsigned long get_data_segment_free_space_size();
 
 //the structure of the block
+typedef struct Meta_Control_Block* mcb_addr;
 struct Meta_Control_Block{
   size_t size;
-  struct Meta_Control_Block * fnext;
+  size_t available;
+  mcb_addr next;
+  mcb_addr prev;
+  mcb_addr fnext;
+  mcb_addr fprev;
 };
-typedef struct Meta_Control_Block block; 
+typedef struct Meta_Control_Block mcb; 
 
 //helper functions
-void merge_free_block(block* pmcb);
-void split_block(block* pcurrent,size_t size);
-void* extend_heap(size_t size);
+void init();//initialize global variables
+size_t align_8(size_t size);
+void merge_block(mcb_addr pmcb);
+void split_block(mcb_addr pcurrent,size_t size);
 void* ff_find(size_t size);
+void* extend_head(size_t size);
 void* bf_find(size_t size);
-void remove_free_block(block* ptr);
-void add_free_block(block* ptr);
+void remove_free_block(mcb_addr pmcb);
+void add_free_block(mcb_addr pmcb);

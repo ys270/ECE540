@@ -1,294 +1,255 @@
 #include<stdio.h>
 #include<unistd.h>
 #include<sys/types.h>
-#include <limits.h>
-#include <pthread.h>
 #include"my_malloc.h"
 
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-__thread block * fhead_nolock = NULL;
-unsigned long heap_size = 0;
-block * fhead_lock = NULL;
-int lock_version=0;
+void* memstart;//the start of the heap
+void* lastaddr;//the end of the heap
+mcb_addr lastnode;//the last node in the heap
+mcb_addr freehead;// the free list's head
+mcb_addr freetail;//the free list's tail
+int has_init=0;//whether we have initialize the gloabl variables
 
-void* ts_malloc_lock(size_t size){
-  lock_version=0;
-  pthread_mutex_lock(&mutex);
-  void* ret = bf_malloc(size);
-  pthread_mutex_unlock(&mutex);
-  return ret;
+//initialize global variables
+void init(){
+  memstart=sbrk(0);
+  lastaddr=memstart;
+  lastnode=NULL;
+  freehead=NULL;
+  freetail=NULL;
+  has_init=1;
 }
 
-void ts_free_lock(void *ptr){
-  pthread_mutex_lock(&mutex);
-  bf_free(ptr);
-  pthread_mutex_unlock(&mutex);
+//make size the multiples of 8
+size_t align_8(size_t size){
+   size=(((size-1)>>3)<<3)+8;
+return size;
 }
 
-void* ts_malloc_nolock(size_t size){
-  lock_version=1;
-  void* ret=bf_malloc(size);
-  return ret;
-}
-void ts_free_nolock(void *ptr){
-  bf_free(ptr);
-}
-
-void split_block(block * ptr, size_t size) {
-  remove_free_block(ptr);
-  block * add = (block *)((char *)ptr + size + sizeof(block));
-  add->size = ptr->size - sizeof(block) - size;
-  ptr->size = size;
-  add_free_block(add);
-}
-
-void remove_free_block(block * ptr) {
-  block* fhead=NULL;
-  if(lock_version==0){
-    fhead=fhead_lock;
-  }
-  else{
-    fhead=fhead_nolock;
-  }
-  if (ptr == fhead) {
-    if (ptr->fnext == NULL) {
-      fhead = NULL;
+//if we find the free block suitable for malloc, enter split function
+//to determine whether we should split the free block or not 
+void split_block(mcb_addr pcurrent,size_t size){
+  remove_free_block(pcurrent);
+  if(pcurrent->size>sizeof(mcb)+size+8){
+    mcb_addr temp=pcurrent->next;
+    mcb_addr current=(void*)pcurrent+size;
+    if(pcurrent!=lastnode){
+      temp->prev=current;
     }
-    else {
-      fhead = ptr->fnext;
+    else{
+      lastnode=current;
     }
-  }
-  else {
-    block * curr = fhead;
-    while (curr->fnext != ptr) {
-      curr = curr->fnext;
+    pcurrent->next=current;
+    current->prev=pcurrent;
+    current->size=pcurrent->size-size;
+    current->available=1;
+    current->next=temp;
+    pcurrent->size=size;
+    add_free_block(current);
     }
-    curr->fnext = ptr->fnext;
-  }
-  if(lock_version==0){
-    fhead_lock=fhead;
-  }
-  else{
-    fhead_nolock=fhead;
-  }
-
 }
 
-void add_free_block(block * ptr) {
-  block* fhead=NULL;
-  if(lock_version==0){
-    fhead=fhead_lock;
-  }
-  else{
-    fhead=fhead_nolock;
-  }
-  if (fhead == NULL) {
-    fhead = ptr;
-    fhead->fnext = NULL;
-  }
-  else if (ptr < fhead) {
-    ptr->fnext = fhead;
-    fhead = ptr;
-  }
-  else{
-    block * current = fhead;
-    while (current->fnext != NULL) {
-    if ((current < ptr) && (ptr < current->fnext)) {
-      block * temp = current->fnext;
-      current->fnext = ptr;
-      ptr->fnext = temp;
+//first fit find, if we find the free block suitable for the required size,
+//set ret to be the block's address. Else, ret=NULL
+void* ff_find(size_t size){
+  size=size+sizeof(mcb);
+  mcb_addr pcurrent=freehead;
+  void* ret=NULL;
+  while(pcurrent!=NULL){
+    if(pcurrent->size>=size){
+      pcurrent->available=0;
+      ret=pcurrent;
+      split_block(pcurrent,size);
       break;
     }
-    current = current->fnext;
+    pcurrent=pcurrent->fnext;
   }
-  if(current->fnext==NULL){
-    current->fnext = ptr;
-    ptr->fnext = NULL;
-  }
-  }
-  if(lock_version==0){
-    fhead_lock=fhead;
-  }
-  else{
-    fhead_nolock=fhead;
-  }
-}
-
-void * ff_malloc(size_t size) {
-  /* if (isInit==0) {
-    block * temp = sbrk(size + sizeof(block));
-    temp->size = size;
-    heap_size +=(size + sizeof(block)); 
-    isInit = 1;
-    void * ret = (void *)((char *)temp + sizeof(block));
-    return ret;
-    }*/
-  void * ans= ff_find(size);
-  if (ans==NULL) {
-    ans = extend_heap(size);
-  }
-  return ans;
-  }
-
-void * extend_heap(size_t size){
-  block* temp=NULL;
-  if(lock_version==0){
-    temp = sbrk(size + sizeof(block));
-  }
-  else{
-    pthread_mutex_lock(&mutex);
-    temp = sbrk(size + sizeof(block));
-    pthread_mutex_unlock(&mutex);
-  }
-    temp->size = size;
-    heap_size += (size + sizeof(block));
-    void * ret = (void *)((char *)temp + sizeof(block));
-    return ret;
-}
-
-void * ff_find(size_t size){
-  block* fhead=NULL;
-  if(lock_version==0){
-    fhead=fhead_lock;
-  }
-  else{
-    fhead=fhead_nolock;
-  }
-  block * current = fhead;
-  void * ret = NULL;
-  while (current != NULL) {
-    if (current->size >= size) {
-      if (current->size > size + sizeof(block)) {
-        split_block(current, size);
-	ret = (void *)((char *)current + sizeof(block));
-        return ret;
-      }
-      remove_free_block(current);
-      ret = (void *)((char *)current + sizeof(block));
-      return ret;
-    }
-    current = current->fnext;
-  }
-  return NULL;
-  }
-
-void * bf_malloc(size_t size){
-  /*  if (isInit==0) {
-    block * temp = sbrk(size + sizeof(block));
-    temp->size = size;
-    heap_size += (size + sizeof(block)); 
-    isInit = 1;
-    void * ret = (void *)((char *)temp + sizeof(block));
-    return ret;
-    }*/
-  void * ret = bf_find(size);
-  if (ret==NULL) {
-    ret = extend_heap(size);
+  if(ret!=NULL){
+    ret=ret+sizeof(mcb);
   }
   return ret;
 }
 
-void * bf_find(size_t size) {
-  block* fhead=NULL;
-  if(lock_version==0){
-    fhead=fhead_lock;
-  }
-  else{
-    fhead=fhead_nolock;
-  }
-  block * ret = NULL;
-  block * current = fhead;
-  long long int smallest_diff = 0x7fffffffffffffff; 
-  while (current) {
-    if ((current->size >= size)) { 
-      int diff = (long long int)(current->size - size);
-      if (diff == 0) { 
-        ret = current;
-        break;
-      }
-      if (diff < smallest_diff) {
-        smallest_diff = diff;
-        ret = current;
+//if we cannot find the suitable free block in heap, we need to extend heap
+//thus, we also need to update lastaddr and lastnode
+void* extend_heap(size_t size){
+  size=size+sizeof(mcb);
+  void* ret=lastaddr;
+  sbrk(size);
+  lastaddr=lastaddr+size;
+  mcb_addr pmcb=(mcb_addr)ret;
+  pmcb->prev=lastnode;
+  pmcb->size=size;
+  pmcb->available=0;
+  pmcb->next=lastaddr;
+  pmcb->fprev=NULL;
+  pmcb->fnext=NULL;
+  lastnode=pmcb;
+  ret=ret+sizeof(mcb);
+  return ret;
+}
+
+//best fit find, loop to find the best place to put the malloc space
+//if we cannot find such block, return NULL
+void* bf_find(size_t size){
+  size=size+sizeof(mcb);
+  mcb_addr pcurrent=freehead;
+  void* ret=NULL;
+  size_t smallest_diff=0xffffffffffffffff;
+  while(pcurrent!=NULL){
+     if(pcurrent->size>=size){
+      size_t diff=pcurrent->size-size;
+      if(diff==0){
+	ret=(void*)pcurrent;
+	break;
+	}
+      if(diff<smallest_diff){
+	ret=(void*)pcurrent;
+        smallest_diff=diff;
       }
     }
-    current = current->fnext;
+    pcurrent=pcurrent->fnext;
   }
+  if(ret!=NULL){
+  mcb_addr add=(mcb_addr)ret;
+  add->available=0;
+  //remove_free_block(add);
+  split_block(add,size);
+  ret=ret+sizeof(mcb);
+  }
+  return ret;
+}
+
+//using helper functions to realize first fit malloc
+void* ff_malloc(size_t size){
+  if(has_init!=1){
+    init();
+  }
+  size=align_8(size);
+  void* ret=ff_find(size);
   if(ret==NULL){
-    return ret;
+    ret=extend_heap(size);
   }
-  else{
-      if ((long long int)(ret->size - size - sizeof(block)) < 0) {
-        remove_free_block(ret);
-	ret = (void *)((char *)ret + sizeof(block));
-        return ret;
-      }
-      else {
-        split_block(ret, size);
-	ret = (void *)((char *)ret + sizeof(block));
-        return ret;
-      }
-    remove_free_block(ret);
-    ret = (void *)((char *)ret + sizeof(block));
-    return ret;
-  }
+  return ret;
 }
 
-void ff_free(void * ptr) {
-  block * temp = (void *)((char *)ptr - sizeof(block));
-  add_free_block(temp);
-  merge_free_block(temp);
+//using helper functions to realize best fit malloc
+void* bf_malloc(size_t size){
+  if(has_init!=1){
+    init();
   }
-
-void bf_free(void * ptr) {
-   block * temp = (void *)((char *)ptr - sizeof(block));
-  add_free_block(temp);
-  merge_free_block(temp);
+  size=align_8(size);
+  void* ret=bf_find(size);
+  if(ret==NULL){
+    ret=extend_heap(size);
+  }
+  return ret;
 }
 
-void merge_free_block(block * ptr){
-  block* fhead=NULL;
-  if(lock_version==0){
-    fhead=fhead_lock;
-  }
-  else{
-    fhead=fhead_nolock;
-  }
-  block * current = fhead;
-  while (current != ptr->fnext) {
-    if ((block *)(current->fnext) == (block *)((char *)current + current->size + sizeof(block))) {
-      current->size = current->size + sizeof(block) + current->fnext->size;
-      current->fnext = current->fnext->fnext;
-      if (!current->fnext) {
-        break;
+//if the block we need to free is next to any freed blocks
+//we need to merge them to form a larger free block
+void merge_block(mcb_addr pmcb){
+  if(pmcb->prev!=NULL){
+    if(pmcb->prev->available==1){
+      remove_free_block(pmcb->prev);
+      pmcb->prev->size=pmcb->prev->size+pmcb->size;
+      pmcb->prev->next=pmcb->next;
+      if(pmcb->next!=lastaddr){
+      pmcb->next->prev=pmcb->prev;
       }
-      if ((block *)(current->fnext) == (block *)((char *)current + current->size + sizeof(block))) {
-        current->size = current->size + sizeof(block) + current->fnext->size;
-        current->fnext = current->fnext->fnext;
-        break;
+      else{
+	lastnode=pmcb->prev;
       }
-      break;
+      pmcb=pmcb->prev;
     }
-    current = current->fnext;
   }
+  if(pmcb->next!=lastaddr){
+    if(pmcb->next->available==1){
+      remove_free_block(pmcb->next);
+      pmcb->size=pmcb->size+pmcb->next->size;
+      pmcb->next=pmcb->next->next;
+      if(pmcb->next!=lastaddr){
+      pmcb->next->prev=pmcb;
+      }
+      else{
+	lastnode=pmcb;
+      }
+    }
+  }
+  add_free_block(pmcb);
 }
 
-unsigned long get_data_segment_size() {
-  return heap_size;
-}
-
-unsigned long get_data_segment_free_space_size() {
-  unsigned long ans = 0;
-  block* fhead=NULL;
-  if(lock_version==0){
-    fhead=fhead_lock;
+//add free block to the freelist 
+void add_free_block(mcb_addr pmcb){
+  if(freehead==NULL){
+    freehead=pmcb;
+    freetail=pmcb;
+    pmcb->fprev=NULL;
+    pmcb->fnext=NULL;
   }
   else{
-    fhead=fhead_nolock;
+    freetail->fnext=pmcb;
+    pmcb->fprev=freetail;
+    freetail=pmcb;
+    freetail->fnext=NULL;
   }
-  block * p = fhead;
-  while (p != NULL) {
-    ans += (p->size + sizeof(block));
-    p = p->fnext;
+}
+
+//remove occupied blocks from the freelist 
+void remove_free_block(mcb_addr pmcb){
+  if(pmcb->fprev==NULL&&pmcb->fnext==NULL){
+    freehead=NULL;
+    freetail=NULL;
   }
-  return ans;
+ else if(pmcb->fprev==NULL){
+    freehead=pmcb->fnext;
+    freehead->fprev=NULL;
+ }
+ else if(pmcb->fnext==NULL){
+    freetail=pmcb->fprev;
+    freetail->fnext=NULL;
   }
+ else{
+   pmcb->fprev->fnext=pmcb->fnext;
+   pmcb->fnext->fprev=pmcb->fprev;
+ }
+ pmcb->fprev=NULL;
+ pmcb->fnext=NULL;
+}
+
+//free function for first fit malloc
+void ff_free(void *ptr){
+  mcb_addr pmcb=(mcb_addr)(ptr-sizeof(mcb));
+  pmcb->available=1;
+  merge_block(pmcb);
+}
+//free function for best fit malloc
+void bf_free(void *ptr){
+  mcb_addr pmcb=(mcb_addr)(ptr-sizeof(mcb));
+  pmcb->available=1;
+  merge_block(pmcb);
+}
+
+//calculate the size of the entire heap
+unsigned long get_data_segment_size(){
+  if(has_init!=1){
+    return 0;
+  }
+  unsigned long res=lastaddr-memstart;
+  return res;
+}
+
+//calculate the size of free blocks
+unsigned long get_data_segment_free_space_size(){
+  unsigned long free_space=0;
+  void* current=memstart;
+  while(current!=lastaddr){
+    mcb_addr pcurrent=current;
+    if(pcurrent->available==1){
+      free_space=free_space+pcurrent->size;
+    }
+    current=pcurrent->next;
+    }
+  return free_space;
+}
+
